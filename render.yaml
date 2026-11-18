@@ -1,0 +1,20 @@
+# Render blueprint — unit 9.
+#
+# Lets Render create the service from this repo in one step (Dashboard →
+# New → Blueprint), instead of clicking through the same settings by hand.
+# Nothing here is required — you can create a Web Service manually and set
+# the same three things: build command, start command, and GEMINI_API_KEY.
+
+services:
+  - type: web
+    name: fitfindr
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn serve:app
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false   # set this in the Render dashboard — never commit it
+      - key: AI201_CACHE
+        value: "1"

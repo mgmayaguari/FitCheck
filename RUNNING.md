@@ -143,15 +143,59 @@ gunicorn serve:app
 | Thing | What it means |
 |---|---|
 | `PORT` | The host tells your app which port to listen on by setting this. Both `serve.py` and `gunicorn` read it, and `serve.py` falls back to `5000` on your machine. Don't hard-code a port |
-| `POST /ask` | `{"query": "...", "wardrobe": {...}}` — wardrobe optional. Returns the session dict, `error` and all |
+| `POST /ask` | `{"query": "...", "wardrobe": {...}}` — wardrobe optional. Returns the session dict, `error` and all, plus a `request_id` to match against the logs |
 | `GET /health` | Says `ok` if the app is awake |
+| `GET /metrics` | Running totals for this process — see below |
 | It answers one request at a time | On purpose. A second request waits for the first to finish, and prints `[serve] another request is still running` while it waits. An MCP tool call starts a whole second Python process, and the free tier's 512 MB has no room for two of those at once — and `generate.py`'s rate-limit counting assumes one caller. The reasoning is written out in `serve.py` |
 | `gunicorn serve:app`, exactly | Not `-k gevent`, not `-k eventlet`, not wrapped for uvicorn. `mcp_client.call_tool` uses `asyncio.run()`, which won't start inside a running event loop, so an async worker breaks **every** MCP call — and only once you've deployed it |
 | The first request is slow | The free tier puts your app to sleep after about fifteen minutes of nothing. The next request wakes it up and waits for it — around a minute. Not a bug, and worth knowing before you demo it |
 
-`serve.py` ships with **no logging and no timing in it**, on purpose. You add
-that yourself in the follow-along, before you deploy — instrumenting first is
-the point of the session.
+### Instrumentation — done in `observability.py` + `serve.py`
+
+Every `/ask` call logs one structured JSON line to **stdout** (not a file — a
+host captures stdout, not your filesystem) with a request id, the outcome
+(`completed`, `no_match`, `model_unavailable`, `quota_exceeded`, `bad_request`,
+`server_error`), the duration in ms, and the model-call/cache/token deltas for
+that one request. `GET /metrics` exposes the running totals for the process:
+request counts by outcome, p50/p95/max latency, total model calls, cache hits,
+tokens. See the module docstring in `observability.py` for why logging and
+metrics are two different things instead of one.
+
+`run_agent`'s own "nothing matched" and "model unavailable" messages are
+business outcomes, not server failures — they're still **200**s, just tagged
+differently in the log/metrics so you can tell "the agent correctly found
+nothing" apart from "the service broke" at a glance. A `QuotaGuard` or
+`ModelUnavailable` that gets raised *outside* `run_agent`'s own handling comes
+back as a **503** with a short message, never a stack trace.
+
+### Deploying it — Render (matches the free-tier notes above)
+
+1. Push this repo to GitHub if it isn't already there.
+2. On [render.com](https://render.com): **New → Blueprint**, point it at this
+   repo. `render.yaml` sets the build command (`pip install -r
+   requirements.txt`), the start command (`gunicorn serve:app`), and the
+   health check path (`/health`) for you.
+3. In the service's **Environment** tab, set `GEMINI_API_KEY` to your key —
+   `render.yaml` deliberately leaves this blank (`sync: false`) so it's never
+   committed.
+4. Deploy. Watch the build logs; the first request after a deploy (or after
+   ~15 minutes idle, on the free plan) wakes the service and is slow — that's
+   the sleep/wake behaviour above, not a failure.
+5. Once it's up:
+   ```bash
+   curl https://<your-service>.onrender.com/health
+   curl -X POST https://<your-service>.onrender.com/ask \
+     -H 'Content-Type: application/json' \
+     -d '{"query": "vintage graphic tee under $30"}'
+   curl https://<your-service>.onrender.com/metrics
+   ```
+   Render's **Logs** tab shows the structured JSON lines as they happen —
+   that's your evidence the instrumentation runs in the deployed process, not
+   just on your laptop.
+
+No Blueprint, no problem — create a **Web Service** by hand, same three
+settings (build command, start command, `GEMINI_API_KEY`), and skip
+`render.yaml` entirely.
 
 ---
 
@@ -166,6 +210,8 @@ the point of the session.
 | `trace.py` | The trace helper, and the loop's stop condition |
 | `app.py` | The command line |
 | `serve.py` | The same agent over HTTP, for deploying — **unit 9** |
+| `observability.py` | Structured JSON logging + `/metrics` counters for `serve.py` — **unit 9** |
+| `Procfile` / `render.yaml` | How a host starts `serve.py` — **unit 9** |
 | `mcp_server.py` | Your MCP server — **unit 4, you register the tool** |
 | `mcp_client.py` | Calling an MCP tool from your agent. Given to you |
 | `scenarios.py` | What your test runs. **You fill this in** |

@@ -27,15 +27,19 @@ web server has to be. The reason is worth reading before you deploy: see the
 note above `_one_at_a_time` below — it also decides which gunicorn worker you
 can use.
 
-⚠️ There is deliberately NO logging, NO timing and NO request counting in this
-file. That is unit 9's follow-along: you instrument this yourself, first, and
-then deploy it. A structured log you were handed teaches you nothing about
-what belongs in one — and the timing field is the one everybody skips.
+Instrumentation (unit 9's follow-along, done): every `/ask` call is timed and
+logged as one structured JSON line to stdout — that's what a host's log
+pipeline actually captures, so that's where it goes, not a local file. A
+`/metrics` route exposes the running totals a host dashboard would want:
+request counts by outcome, latency percentiles, model calls, cache hits,
+tokens. See `observability.py` for why it's split into logging (what happened
+on *this* request) versus metrics (how is the service doing *right now*).
 """
 
 import os
 import sys
 import threading
+import time
 
 # config first, and before anything that talks to the model: it loads your .env
 # and fixes the Windows console encoding for every module that imports it.
@@ -43,10 +47,15 @@ import config  # noqa: F401
 
 from flask import Flask, jsonify, request
 
+import generate
 from agent import run_agent
+from generate import ModelUnavailable, QuotaGuard
+from observability import Metrics, configure_logging, log_event, new_request_id
 from utils.data_loader import get_example_wardrobe
 
 app = Flask(__name__)
+_logger = configure_logging()
+_metrics = Metrics()
 
 
 # ── one request at a time ─────────────────────────────────────────────────────
@@ -97,6 +106,21 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.get("/metrics")
+def metrics():
+    """
+    Running totals for this process: request counts by outcome, latency
+    percentiles, model calls, cache hits, tokens. See observability.py.
+
+    This is one process's view, not a fleet's — it resets on restart, and a
+    host that runs more than one instance of this app would need something
+    that isn't a module-level dict. Fine for this deployment: serve.py is
+    built to answer one request at a time on one instance (see
+    `_one_at_a_time` above), so there's only ever one of these to look at.
+    """
+    return jsonify(_metrics.snapshot())
+
+
 @app.post("/ask")
 def ask():
     """
@@ -107,12 +131,26 @@ def ask():
                                                 example wardrobe the CLI uses.
     Out:  the session dict from run_agent(), as JSON.
     """
+    request_id = new_request_id()
+    started = time.monotonic()
+
     payload = request.get_json(silent=True) or {}
     query = (payload.get("query") or "").strip()
     if not query:
+        duration_ms = (time.monotonic() - started) * 1000
+        log_event(
+            _logger,
+            event="ask",
+            request_id=request_id,
+            outcome="bad_request",
+            status=400,
+            duration_ms=round(duration_ms, 1),
+        )
+        _metrics.record("bad_request", duration_ms)
         # 400 rather than a stack trace: the caller can act on this one.
         return jsonify({"error": "Send JSON with a 'query' field, e.g. "
-                                 '{"query": "vintage graphic tee under $30"}'}), 400
+                                 '{"query": "vintage graphic tee under $30"}',
+                         "request_id": request_id}), 400
 
     wardrobe = payload.get("wardrobe")
     if not isinstance(wardrobe, dict):
@@ -122,13 +160,8 @@ def ask():
     # second caller just sits there, and "slow" and "waiting its turn" are
     # indistinguishable from the outside — which is how people conclude the
     # deployment is broken when it is behaving exactly as designed.
-    #
-    # This is NOT the logging you add in the follow-along. It prints nothing
-    # on the normal path, carries no timing and counts nothing; it says only
-    # that this request had to wait. `locked()` can be a moment out of date,
-    # so the note is occasionally missed — which costs nothing, because
-    # nothing depends on it.
-    if _one_at_a_time.locked():
+    waited_for_lock = _one_at_a_time.locked()
+    if waited_for_lock:
         print(
             "  [serve] another request is still running. This one is waiting "
             "its turn — serve.py handles one at a time, on purpose.",
@@ -136,20 +169,79 @@ def ask():
             flush=True,
         )
 
-    failure = None
+    calls_before = generate.call_count()
+    tokens_before = generate.token_counts()
+    cache_hits_before = generate.cache_hit_count()
+
+    status = 200
+    outcome = "completed"
+    error_detail = None
     session = None
+
     with _one_at_a_time:
         try:
             session = run_agent(query, wardrobe)
+            if session["error"]:
+                # A clean "nothing matched" or "model unavailable" message
+                # from run_agent is a normal outcome of the loop, not a server
+                # failure — it's still a 200, just one worth telling apart
+                # from a fit card in the numbers.
+                outcome = (
+                    "model_unavailable"
+                    if "model" in session["error"].lower()
+                    else "no_match"
+                )
+        except QuotaGuard as exc:
+            status, outcome, error_detail = 503, "quota_exceeded", str(exc)
+        except ModelUnavailable as exc:
+            status, outcome, error_detail = 503, "model_unavailable", str(exc)
         except Exception as exc:  # noqa: BLE001 — a 500 with a sentence beats a hang
-            failure = f"{type(exc).__name__}: {exc}"
+            status, outcome = 500, "server_error"
+            error_detail = f"{type(exc).__name__}: {exc}"
+            _logger.exception("unhandled error in /ask", extra={"fields": {
+                "event": "ask_error", "request_id": request_id,
+            }})
 
-    # Outside the lock: building a response is not work the next caller should
-    # be waiting on.
-    if failure is not None:
-        return jsonify({"error": failure}), 500
+    # Outside the lock: building a response and logging are not work the next
+    # caller should be waiting on.
+    duration_ms = (time.monotonic() - started) * 1000
+    calls_made = generate.call_count() - calls_before
+    cache_hits_made = generate.cache_hit_count() - cache_hits_before
+    tokens_after = generate.token_counts()
+    prompt_tokens_made = tokens_after["prompt"] - tokens_before["prompt"]
+    output_tokens_made = tokens_after["output"] - tokens_before["output"]
 
-    return jsonify(session)
+    log_event(
+        _logger,
+        event="ask",
+        request_id=request_id,
+        outcome=outcome,
+        status=status,
+        duration_ms=round(duration_ms, 1),
+        waited_for_lock=waited_for_lock,
+        query_chars=len(query),
+        wardrobe_items=len(wardrobe.get("items", [])),
+        model_calls=calls_made,
+        cache_hits=cache_hits_made,
+        prompt_tokens=prompt_tokens_made,
+        output_tokens=output_tokens_made,
+        relaxed=session["relaxed"] if session else [],
+    )
+    _metrics.record(
+        outcome,
+        duration_ms,
+        model_calls=calls_made,
+        cache_hits=cache_hits_made,
+        prompt_tokens=prompt_tokens_made,
+        output_tokens=output_tokens_made,
+    )
+
+    if error_detail is not None:
+        return jsonify({"error": error_detail, "request_id": request_id}), status
+
+    body = dict(session)
+    body["request_id"] = request_id
+    return jsonify(body), status
 
 
 if __name__ == "__main__":
