@@ -170,6 +170,9 @@ back as a **503** with a short message, never a stack trace.
 
 ### Deploying it — Render (matches the free-tier notes above)
 
+**Live:** [fitfindr-p3ks.onrender.com](https://fitfindr-p3ks.onrender.com) —
+`/health`, `/ask`, `/metrics`, same routes as local.
+
 1. Push this repo to GitHub if it isn't already there.
 2. On [render.com](https://render.com): **New → Blueprint**, point it at this
    repo. `render.yaml` sets the build command (`pip install -r
@@ -183,19 +186,29 @@ back as a **503** with a short message, never a stack trace.
    the sleep/wake behaviour above, not a failure.
 5. Once it's up:
    ```bash
-   curl https://<your-service>.onrender.com/health
-   curl -X POST https://<your-service>.onrender.com/ask \
+   curl https://fitfindr-p3ks.onrender.com/health
+   curl -X POST https://fitfindr-p3ks.onrender.com/ask \
      -H 'Content-Type: application/json' \
      -d '{"query": "vintage graphic tee under $30"}'
-   curl https://<your-service>.onrender.com/metrics
+   curl https://fitfindr-p3ks.onrender.com/metrics
    ```
    Render's **Logs** tab shows the structured JSON lines as they happen —
-   that's your evidence the instrumentation runs in the deployed process, not
-   just on your laptop.
+   that's the evidence the instrumentation runs in the deployed process, not
+   just on a laptop.
 
 No Blueprint, no problem — create a **Web Service** by hand, same three
 settings (build command, start command, `GEMINI_API_KEY`), and skip
 `render.yaml` entirely.
+
+⚠️ **Env vars only take effect on the next process start.** Changing
+`GEMINI_API_KEY` in the dashboard doesn't reach an already-running process —
+it has to actually restart. If `/ask` keeps failing right after you've
+"fixed" the key, check `/metrics`'s `uptime_seconds`: if it's still counting
+up from before your change, that's the same process, still holding the old
+(or missing) value. Force a redeploy (**Manual Deploy → Deploy latest
+commit**, or **Restart**) and confirm `uptime_seconds` actually reset before
+testing again. This is exactly what happened on the first deploy here — see
+**Deploy and Instrument** in the README.
 
 ---
 

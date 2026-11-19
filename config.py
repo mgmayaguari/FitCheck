@@ -89,6 +89,26 @@ MAX_RETRIES = 5
 CACHE_DIR = ROOT / ".cache"
 
 
+# ─── Guardrails for serve.py ──────────────────────────────────────────────────
+# Unit 9. Two different protections, because they protect two different
+# things — see limits.py.
+
+# How long one HTTP caller to /ask waits before getting an answer, timed out
+# or not. Two model calls, each allowed up to MAX_RETRIES attempts with a
+# rate-limit backoff of up to ~65s apiece, means a legitimate worst case can
+# run well past a minute on its own — this is a ceiling on patience, not an
+# estimate of how long a normal run takes.
+REQUEST_TIMEOUT_SECONDS = 90
+
+# Requests a single IP may send to /ask per rolling minute before getting a
+# 429. One agent run takes several seconds on its own, so a person clicking
+# around the app stays well under this even retrying a few queries in a row.
+# A script firing requests back to back does not — and because /ask answers
+# one caller at a time (see serve.py's _one_at_a_time), that script would
+# otherwise make every other caller queue behind it, not just itself.
+RATE_LIMIT_PER_MINUTE = 6
+
+
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
 DATA_DIR = ROOT / "data"

@@ -488,93 +488,126 @@ No criterion is MISSED in the after run, but these are still weak or untested:
 
 ## Deploy and Instrument
 
-Everything above this line runs one command and exits. A host has nothing to
-keep running, so before any of it can be deployed it needed something that
-stays up — `serve.py` — and that something needed to tell me what it's doing
-once it's out of reach of my own terminal.
+`serve.py` shipped with no logging, no timing, and no request counting, on
+purpose — that's the thing this unit has me add myself before deploying.
+Everything else in this repo exits after one command. A host has nothing to
+keep running, so once this is somewhere else, the only way I find out it's
+broken is if I built something that tells me.
 
-**What I built:**
+**What I added:**
 
-- `observability.py` — one structured JSON log line per `/ask` request, to
-  **stdout** (what a host's log pipeline actually captures, not a local file
-  I'd lose on restart), plus an in-memory `Metrics` object for a `GET
-  /metrics` route.
-- Every request is classified into an **outcome**, not just a status code:
+- `observability.py` — one structured JSON line per `/ask` request, to
+  **stdout**, not a file. A host captures stdout, not my filesystem, and a
+  log file on a free-tier dyno disappears the second it restarts anyway.
+- Every request gets classified into an outcome, not just a status code:
   `completed`, `no_match`, `model_unavailable`, `quota_exceeded`,
   `bad_request`, `server_error`. `run_agent` finding nothing, or the model
-  being unreachable, are normal outcomes of the loop — still a `200` — and I
-  wanted them countable separately from an actual server failure (`500`) or a
-  real capacity problem (`503` for `QuotaGuard`/`ModelUnavailable` raised
-  outside `run_agent`'s own handling).
-- `/metrics` reports request counts by outcome, p50/p95/max latency over the
-  last 500 requests, and the running totals `generate.py` already tracks
-  (model calls, cache hits, prompt/output tokens) — pulled in as a delta
-  per request, not just a session-wide total.
-- `Procfile` and `render.yaml` for the host (`gunicorn serve:app`, same
-  constraint as the rest of this repo: the default sync worker, not an async
-  one — see the comment above `_one_at_a_time` in `serve.py`).
+  being unreachable, are things the loop is *supposed* to handle — still a
+  `200` — and I wanted those countable separately from the service actually
+  being down.
+- `GET /metrics` — request counts by outcome, p50/p95/max latency, and the
+  model-call/cache/token numbers `generate.py` was already tracking, pulled in
+  as a per-request delta instead of one session-wide total.
+- `Procfile` + `render.yaml` to deploy it to Render, same sync-worker
+  constraint the rest of this repo already assumes (`gunicorn serve:app`, not
+  `-k gevent` — breaks every MCP call, see `serve.py`).
 
-**Why logging and metrics are two separate things:** a log line answers "what
-happened on request `de4cf5ff015e`?"; `/metrics` answers "how is the service
-doing right now?". One JSON line per request is useless for the second
-question without re-deriving it by hand every time someone asks, and a single
+Logging and metrics answer two different questions, so I kept them as two
+different things: a log line tells me what happened on one request;
+`/metrics` tells me how the service is doing right now. A pile of JSON lines
+can't answer the second one without me grepping it by hand every time, and a
 running counter can't answer the first one at all.
 
-**Evidence it works — local, `python serve.py`, real model calls:**
+**Local evidence, real model calls, before deploying anything:**
 
-A matching query, logged and counted as `completed`:
+A matching query, counted as `completed`:
 
 ```json
 {"ts": "2026-11-18T18:15:54", "level": "INFO", "event": "ask", "request_id": "de4cf5ff015e", "outcome": "completed", "status": 200, "duration_ms": 981.6, "waited_for_lock": false, "query_chars": 29, "wardrobe_items": 10, "model_calls": 0, "cache_hits": 2, "prompt_tokens": 0, "output_tokens": 0, "relaxed": []}
 ```
 
-An impossible query, logged and counted as `no_match` — still a `200`, still
-distinct from a failure:
+An impossible query, counted as `no_match` — still a `200`:
 
 ```json
 {"ts": "2026-11-18T18:15:59", "level": "INFO", "event": "ask", "request_id": "955c93933616", "outcome": "no_match", "status": 200, "duration_ms": 1371.5, "waited_for_lock": false, "query_chars": 35, "wardrobe_items": 10, "model_calls": 0, "cache_hits": 0, "prompt_tokens": 0, "output_tokens": 0, "relaxed": ["size XXS", "price limit $5"]}
 ```
 
-A request with no `query` field, rejected before it ever reaches
-`run_agent`:
+A request with no `query` field, rejected before `run_agent` ever runs:
 
 ```json
 {"ts": "2026-11-18T18:15:59", "level": "INFO", "event": "ask", "request_id": "35e113ea610f", "outcome": "bad_request", "status": 400, "duration_ms": 0.1}
 ```
 
-`GET /metrics` after those three requests:
+`/metrics` after those three:
 
 ```json
 {"cache_hits_total": 2, "latency_ms": {"max": 1371.5, "p50": 981.6, "p95": 1371.5, "samples": 3}, "model_calls_total": 0, "requests_by_outcome": {"bad_request": 1, "completed": 1, "no_match": 1}, "requests_total": 3, "tokens_total": {"output": 0, "prompt": 0}}
 ```
 
-(`model_calls_total: 0` and `cache_hits_total: 2` on a "completed" run is
-correct, not a bug — this exact query had already been cached from an earlier
-unit's run, so both model calls this time were cache hits. Run with
-`AI201_CACHE=0` for real per-run token numbers, same as `run_eval.py` does.)
+(`model_calls_total: 0` with `cache_hits_total: 2` on a `completed` run isn't
+a bug — that query was already cached from an earlier unit, so both model
+calls were cache hits this time. `AI201_CACHE=0` gives real per-run token
+numbers, same as `run_eval.py` already does for evaluation runs.)
 
-I also simulated the two operational failure paths directly against the Flask
-test client, since neither a real `ModelUnavailable` nor a real `QuotaGuard`
-happened to fire during this run (the same honesty `generate.py`'s handler
-needed in Unit 4 — a handler that's never seen a real failure is only proven
-by a test, not by a run):
+I didn't get a real `ModelUnavailable` or `QuotaGuard` locally, so I tested
+both the same way unit 4 told me to test a handler that's never seen a real
+failure: by raising them directly against the Flask test client instead of
+waiting for the service to actually go down.
 
 ```json
 {"outcome": "model_unavailable", "status": 503, ...}
 {"outcome": "quota_exceeded", "status": 503, ...}
 ```
 
-Both returned a one-line JSON error with a `request_id` and no stack trace,
-and both were counted under their own outcome in `/metrics` — a `model
-unavailable` 503 and a `quota exceeded` 503 are different operational
-problems, and the numbers should say which one happened, not just "it
-failed."
+Both came back as a one-line JSON error with a `request_id`, no stack trace,
+and landed in `/metrics` under their own outcome — which turned out to matter
+more than I expected, once I actually deployed.
 
-**Deployment:** `RUNNING.md` has the exact steps (Render, via `render.yaml`).
-A host-side run, with the same `/health`, `/ask`, and `/metrics` evidence
-pasted from the live URL instead of localhost, is the next thing to add here
-once it's deployed — the code and the local proof it works are both done; the
-account and the URL are not mine to create.
+**Deployed: [fitfindr-p3ks.onrender.com](https://fitfindr-p3ks.onrender.com)**
+
+**It broke on the first real deploy, and the instrumentation is what told me.**
+`/health` came back fine right after deploying, but every `/ask` returned
+`"The model rejected your API key"` — `outcome: model_unavailable` in both the
+log line and `/metrics`, `model_calls_total: 0`. My local `.env` key was fine,
+so this wasn't the model being down; it was Render not actually having the
+key. I'd set `GEMINI_API_KEY` in the dashboard, but the running process had
+started before that, and env vars are only read at process start — saving a
+new value doesn't reach a process that's already up. `/metrics` showing
+`uptime_seconds: 820.5` across that whole stretch was the giveaway: the same
+process had been running the entire time I kept re-testing, so of course it
+never saw the new value. I forced a redeploy, `uptime_seconds` reset to under
+a minute, and the next `/ask` came back clean:
+
+```
+selected_item: Y2K Baby Tee — Butterfly Print ($18.0, depop)
+error: None
+```
+
+```json
+{"requests_by_outcome": {"bad_request": 1}, "requests_total": 1, "uptime_seconds": 52.0}
+```
+
+That's the whole point of building this before deploying rather than after:
+on my laptop, a bad key just means the one request in front of me fails and I
+go look at `.env`. Deployed, the first sign of the same bug would otherwise
+have been a user getting a mystery message with nothing behind it. Having
+`/metrics` split `model_unavailable` out from everything else, and having
+`uptime_seconds` right there next to it, is what turned "it's broken" into
+"the key isn't reaching the process" in under a minute instead of a guessing
+match against the whole deploy.
+
+**One more thing worth writing down, not fixed:** partway through re-testing,
+`/ask` returned a bare Render `502` for one request, and `/metrics` reset to
+`uptime_seconds: 41.3` right after — the process restarted on its own between
+two of my calls. I didn't chase down whether that was the free tier recycling
+the instance or something in my own app running it out of memory (each MCP
+retry spawns a whole extra Python process, and the free tier's 512 MB isn't
+much room for that), and either way the in-memory `Metrics` object doesn't
+survive a restart — it's a running count for *this* process, not history. A
+host that cared about that number past a restart would need to ship it
+somewhere outside the process instead of keeping it in a module-level dict.
+I'm noting it here instead of solving it, the same way Unit 4 has a "What's
+Still Broken" section for exactly this reason.
 
 ---
 

@@ -34,6 +34,14 @@ pipeline actually captures, so that's where it goes, not a local file. A
 request counts by outcome, latency percentiles, model calls, cache hits,
 tokens. See `observability.py` for why it's split into logging (what happened
 on *this* request) versus metrics (how is the service doing *right now*).
+
+Two guardrails on top of that, in `limits.py`: a per-IP rate limit (a script
+firing requests back to back otherwise makes every other caller queue behind
+it — see `_one_at_a_time` below) and a per-request timeout (a caller gets a
+bounded wait instead of hanging forever on a stuck model call). Neither one
+is a cap on this app pretending to be busier than it is; both exist because
+`/ask` answers one caller at a time, so one bad caller can otherwise degrade
+the service for everyone else, not just themselves.
 """
 
 import os
@@ -45,17 +53,19 @@ import time
 # and fixes the Windows console encoding for every module that imports it.
 import config  # noqa: F401
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 import generate
 from agent import run_agent
 from generate import ModelUnavailable, QuotaGuard
+from limits import IPRateLimiter, run_with_timeout
 from observability import Metrics, configure_logging, log_event, new_request_id
 from utils.data_loader import get_example_wardrobe
 
 app = Flask(__name__)
 _logger = configure_logging()
 _metrics = Metrics()
+_rate_limiter = IPRateLimiter(config.RATE_LIMIT_PER_MINUTE)
 
 
 # ── one request at a time ─────────────────────────────────────────────────────
@@ -100,6 +110,29 @@ _metrics = Metrics()
 _one_at_a_time = threading.Lock()
 
 
+def _client_ip() -> str:
+    """
+    The caller's IP, for rate limiting.
+
+    Render (like most hosts) sits in front of this app as a reverse proxy, so
+    `request.remote_addr` is Render's own edge, not the caller. The real
+    client IP is the first entry in `X-Forwarded-For`, which the proxy sets —
+    a direct caller can't forge the proxy's own header the same way, since
+    Render appends to it rather than passing through whatever a client sent.
+    Falls back to `remote_addr` for local runs, where there's no proxy at all.
+    """
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def _run_agent_locked(query: str, wardrobe: dict) -> dict:
+    """The actual agent run, holding `_one_at_a_time` for its whole duration."""
+    with _one_at_a_time:
+        return run_agent(query, wardrobe)
+
+
 @app.get("/health")
 def health():
     """Is the server awake? A host pings something like this to find out."""
@@ -133,6 +166,32 @@ def ask():
     """
     request_id = new_request_id()
     started = time.monotonic()
+    client_ip = _client_ip()
+
+    # The cheapest possible rejection, before any JSON parsing or agent work:
+    # a client going too fast is turned away here, never reaches the lock,
+    # and costs nothing but a dict lookup.
+    allowed, retry_after = _rate_limiter.allow(client_ip)
+    if not allowed:
+        duration_ms = (time.monotonic() - started) * 1000
+        log_event(
+            _logger,
+            event="ask",
+            request_id=request_id,
+            outcome="rate_limited",
+            status=429,
+            duration_ms=round(duration_ms, 1),
+            client_ip=client_ip,
+            retry_after=round(retry_after, 1),
+        )
+        _metrics.record("rate_limited", duration_ms)
+        response = jsonify({
+            "error": f"Too many requests. Try again in {retry_after:.0f}s.",
+            "request_id": request_id,
+        })
+        response.status_code = 429
+        response.headers["Retry-After"] = str(int(retry_after) + 1)
+        return response
 
     payload = request.get_json(silent=True) or {}
     query = (payload.get("query") or "").strip()
@@ -178,29 +237,43 @@ def ask():
     error_detail = None
     session = None
 
-    with _one_at_a_time:
-        try:
-            session = run_agent(query, wardrobe)
-            if session["error"]:
-                # A clean "nothing matched" or "model unavailable" message
-                # from run_agent is a normal outcome of the loop, not a server
-                # failure — it's still a 200, just one worth telling apart
-                # from a fit card in the numbers.
-                outcome = (
-                    "model_unavailable"
-                    if "model" in session["error"].lower()
-                    else "no_match"
-                )
-        except QuotaGuard as exc:
-            status, outcome, error_detail = 503, "quota_exceeded", str(exc)
-        except ModelUnavailable as exc:
-            status, outcome, error_detail = 503, "model_unavailable", str(exc)
-        except Exception as exc:  # noqa: BLE001 — a 500 with a sentence beats a hang
-            status, outcome = 500, "server_error"
-            error_detail = f"{type(exc).__name__}: {exc}"
-            _logger.exception("unhandled error in /ask", extra={"fields": {
-                "event": "ask_error", "request_id": request_id,
-            }})
+    try:
+        session = run_with_timeout(
+            _run_agent_locked, config.REQUEST_TIMEOUT_SECONDS, query, wardrobe,
+        )
+        if session["error"]:
+            # A clean "nothing matched" or "model unavailable" message
+            # from run_agent is a normal outcome of the loop, not a server
+            # failure — it's still a 200, just one worth telling apart
+            # from a fit card in the numbers.
+            outcome = (
+                "model_unavailable"
+                if "model" in session["error"].lower()
+                else "no_match"
+            )
+    except TimeoutError:
+        # The agent run itself is NOT stopped — see limits.py. This request
+        # simply stops waiting for it and tells the caller so, honestly,
+        # instead of leaving their connection open with nothing to show for
+        # it. The model-call/token deltas logged below may undercount this
+        # request's real cost: the run can still be making calls on its
+        # worker thread after we've already answered.
+        status, outcome = 504, "timeout"
+        error_detail = (
+            f"The agent didn't finish within {config.REQUEST_TIMEOUT_SECONDS:g}s. "
+            "It may still be running in the background, but this request has "
+            "given up waiting on it. Try again, or with a narrower query."
+        )
+    except QuotaGuard as exc:
+        status, outcome, error_detail = 503, "quota_exceeded", str(exc)
+    except ModelUnavailable as exc:
+        status, outcome, error_detail = 503, "model_unavailable", str(exc)
+    except Exception as exc:  # noqa: BLE001 — a 500 with a sentence beats a hang
+        status, outcome = 500, "server_error"
+        error_detail = f"{type(exc).__name__}: {exc}"
+        _logger.exception("unhandled error in /ask", extra={"fields": {
+            "event": "ask_error", "request_id": request_id,
+        }})
 
     # Outside the lock: building a response and logging are not work the next
     # caller should be waiting on.
