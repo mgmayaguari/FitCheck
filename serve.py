@@ -133,6 +133,17 @@ def _run_agent_locked(query: str, wardrobe: dict) -> dict:
         return run_agent(query, wardrobe)
 
 
+@app.get("/")
+def index():
+    """
+    The terminal-style frontend — static/index.html, a plain fetch() against
+    /ask. No build step, no framework: it's one file, served as-is. Flask
+    already serves everything else under static/ at /static/<path>; this
+    just answers the bare "/" a browser actually requests.
+    """
+    return send_from_directory(app.static_folder, "index.html")
+
+
 @app.get("/health")
 def health():
     """Is the server awake? A host pings something like this to find out."""
