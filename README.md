@@ -1,5 +1,14 @@
 # FitFindr
 
+🟢 **Live:** [fitfindr-p3ks.onrender.com](https://fitfindr-p3ks.onrender.com) —
+a terminal-style page, no setup needed. Type something like `vintage graphic
+tee under $30` and hit Enter. It's on Render's free tier, so the first
+request after it's been idle a while can take close to a minute to wake up —
+that's the host sleeping it, not a bug. I'm leaving it up since it costs
+nothing, but it's a free-tier instance with no uptime guarantee, so if it's
+down, that's why — the code and the full local run instructions below still
+work regardless.
+
 > ### 👋 Start here
 >
 > **New to this repo? Read [RUNNING.md](RUNNING.md) first** — setup, every
@@ -596,18 +605,51 @@ have been a user getting a mystery message with nothing behind it. Having
 "the key isn't reaching the process" in under a minute instead of a guessing
 match against the whole deploy.
 
-**One more thing worth writing down, not fixed:** partway through re-testing,
-`/ask` returned a bare Render `502` for one request, and `/metrics` reset to
-`uptime_seconds: 41.3` right after — the process restarted on its own between
-two of my calls. I didn't chase down whether that was the free tier recycling
-the instance or something in my own app running it out of memory (each MCP
-retry spawns a whole extra Python process, and the free tier's 512 MB isn't
-much room for that), and either way the in-memory `Metrics` object doesn't
-survive a restart — it's a running count for *this* process, not history. A
-host that cared about that number past a restart would need to ship it
-somewhere outside the process instead of keeping it in a module-level dict.
-I'm noting it here instead of solving it, the same way Unit 4 has a "What's
-Still Broken" section for exactly this reason.
+**One more thing worth writing down, and now I know exactly what it is:**
+partway through re-testing, `/ask` returned a bare Render `502`, and
+`/metrics` reset to `uptime_seconds: 41.3` right after — the process had
+restarted on its own between two of my calls. At the time I hadn't chased down
+whether that was the free tier recycling the instance or my own app running
+out of memory. It's the second one. Asking `"shorts under $10 size M"` later
+got a real `500`, and Render's own logs named it directly: `Worker (pid:59)
+was sent SIGKILL! Perhaps out of memory?` — that's gunicorn's arbiter, not my
+code, which is exactly why my own error handling never saw it. A `SIGKILL`
+ends the whole worker process; there's no Python exception left for `/ask`'s
+`except Exception` to catch, so the caller gets a bare 500 with no
+`request_id` and no log line, and the instrumentation I built this unit is
+structurally unable to log a request whose process no longer exists to write
+the log.
+
+**Why that specific query did it:** nothing matches size M, then nothing
+matches under $10 either, so the loop relaxes twice before it finds a result
+— three `search_listings` calls in one run instead of one. `mcp_client.py`
+starts a brand-new `mcp_server.py` process *per call*, by design (its own
+docstring: "every call starts the server, asks, and stops it again" — the
+right trade for Unit 4, where the point was seeing the MCP seam, not
+production memory). So this one query spins up three extra Python
+interpreters in sequence, on top of the gunicorn/Flask/`google-genai` process
+already running, and the free tier's 512 MB doesn't have room for that. It
+doesn't take a flood of requests to hit this — the rate limiter and the
+timeout from earlier in this unit don't help here, because this is one
+well-behaved caller, not a bot.
+
+**What I did about it: nothing, on purpose.** The actual fix — one MCP
+session held open for the whole agent run instead of one per
+`search_listings` call — would cut this query's subprocess count from 3 to 1
+and very likely solve it. I'm not making that change here, because it reaches
+back into `agent.py` and `mcp_client.py` from Unit 4, and it would make this
+README's own "On the MCP move" paragraph (**"call_tool starts the server for
+each call, so an impossible query starts it three times"**) describe code
+that no longer exists. That line was true and graded as written; I'd rather
+leave Unit 4 alone and carry this as a known limitation of the free-tier
+deployment than quietly rewrite graded code under cover of a later unit. The
+in-memory `Metrics` object has the same kind of gap for a different reason:
+it doesn't survive a restart either way, OOM-triggered or not — it's a
+running count for *this* process, not history, and a host that cared about
+the number past a restart would need to ship it somewhere outside the
+process instead of a module-level dict. I'm noting both here instead of
+solving them, the same way Unit 4 has a "What's Still Broken" section for
+exactly this reason.
 
 ---
 

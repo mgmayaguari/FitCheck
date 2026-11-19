@@ -290,6 +290,9 @@ is the most common architectural failure in production agents.
 | `IncompleteFieldDefinitionWarning: Field 'lifespan'` | Harmless noise from the MCP library's dependencies. Not your code, not an error. Ignore it |
 | A price ceiling you typed is being ignored | You used double quotes in PowerShell. `$30` vanished. Use single quotes |
 | `UnicodeEncodeError: 'charmap' codec can't encode` | Shouldn't happen — `config.py` sets the console to UTF-8. If you see it, you're running a file that doesn't import `config` |
+| `429 Too Many Requests` from `/ask` | Working as intended — unit 9's `limits.IPRateLimiter`. That IP sent more than `config.RATE_LIMIT_PER_MINUTE` requests in the last minute. `Retry-After` says how long to wait |
+| `504` from `/ask`, `"The agent didn't finish within ...s"` | Unit 9's `limits.run_with_timeout` gave up waiting past `config.REQUEST_TIMEOUT_SECONDS`. The agent run itself is **not** stopped — it keeps going on its own thread and may still finish; this is a bound on how long the caller waited, not a cancellation |
+| A bare `500` on Render, no `request_id`, no JSON error body | A SIGKILL, not an exception — check Render's **Logs** tab for `Worker (pid:N) was sent SIGKILL! Perhaps out of memory?`. Nothing in `serve.py`'s own error handling can catch this; the whole worker process was killed. See **Deploy and Instrument** in the README for the specific query that triggers it and why (three MCP subprocess spins in one request, on the free tier's 512 MB) |
 
 Still stuck after one honest attempt? Post in the help channel with the full
 error, what you ran, and what you expected.
